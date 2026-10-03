@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>When Small Updates Disappear</title>
+<meta name="description" content="Why low-precision optimizer states ignore small updates, a simple model that predicts how often, and an FP32-to-BF16 stochastic-rounding kernel in Triton.">
+<link rel="canonical" href="https://kristitopollai.github.io/blog/quantization/">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://kristitopollai.github.io/blog/quantization/">
+<meta property="og:title" content="When Small Updates Disappear">
+<meta property="og:description" content="Why low-precision optimizer states ignore small updates, a simple model that predicts how often, and an FP32-to-BF16 stochastic-rounding kernel in Triton.">
+<meta property="og:image" content="https://kristitopollai.github.io/assets/portrait.jpg">
+<meta name="twitter:card" content="summary">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Ccircle cx=%278%27 cy=%278%27 r=%277%27 fill=%27%236d4bd6%27/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&family=Martian+Mono:wdth,wght@75..112.5,400..800&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.css">
+<link rel="stylesheet" href="../notes.css?v=20261003p">
+<link rel="stylesheet" href="style.css?v=20261003p">
+</head>
+<body>
+
+<div class="topbar"><div class="in">
+  <a class="brand" href="../../">~/kristi-topollai/notes</a>
+  <nav><a href="#sec-nearest">Theory</a><a href="#sec-evidence">Evidence</a><a href="#sec-triton">Triton</a><a href="https://github.com/KristiTopollai/stochastic-rounding-pytorch">Code</a></nav>
+</div><div class="progress"></div></div>
+
+<div class="page">
+<aside class="toc">
+  <div class="h">Contents</div>
+  <a href="#tldr">TL;DR</a>
+  <a href="#sec-stalling">1. Small updates can vanish</a>
+  <a class="sub" href="#ema">1.1 The optimizer's memory</a>
+  <a href="#sec-nearest">2. Nearest rounding</a>
+  <a class="sub" href="#stuck">2.2 Stuck going up</a>
+  <a class="sub" href="#predictor">2.3 A stalling probability</a>
+  <a href="#sec-stochastic">3. Stochastic rounding</a>
+  <a class="sub" href="#bias">3.3 Stalled is not biased</a>
+  <a href="#sec-evidence">4. Prediction vs. training</a>
+  <a href="#sec-training">5. Effect on training</a>
+  <a href="#sec-pytorch">6. A PyTorch cast</a>
+  <a class="sub" href="#bits">6.1 The probability in the bits</a>
+  <a href="#sec-triton">7. A short intro to Triton</a>
+  <a class="sub" href="#kernel">7.1 The kernel</a>
+  <a class="sub" href="#rounding-helper">7.2 The rounding helpers</a>
+  <a href="#sec-speed">8. How fast is it?</a>
+  <a class="sub" href="#optimizers">8.1 Inside an optimizer</a>
+  <a href="#sec-conclusion">9. Conclusion</a>
+  <a href="#refs">References</a>
+  <a href="#cite">Citation</a>
+</aside>
+
+<article id="top">
+
+<h1 class="title">When Small Updates Disappear</h1>
+<p class="subtitle">Why low-precision optimizer states ignore small updates, and a Triton kernel that fixes it</p>
+<p class="byline"><b>Kristi Topollai</b></p>
+<p class="meta">September 2026 · <a href="https://arxiv.org/abs/2603.16731">Paper (EMNLP 2026)</a> · <a href="https://github.com/KristiTopollai/stochastic-rounding-pytorch">Code on GitHub</a></p>
+
+<p class="companion">This post is a companion to our EMNLP 2026 paper, <a href="https://arxiv.org/abs/2603.16731"><em>Understanding Quantization of Optimizer States in LLM Pre-training</em></a><sup class="fn"><a href="#ref-paper">[1]</a></sup>.</p>
+
+<div class="tldr" id="tldr">
+<h4>TL;DR</h4>
+<ul>
+<li>If an optimizer state is stored in low precision, a small update can round straight back to the old value. The update is computed and then lost, and the lost pieces never add up. This is <strong>state-update stalling</strong>.</li>
+<li>For Adam's second moment with $\beta_2=0.999$, a short calculation predicts that <strong>about 94.6% of updates stall</strong> in BF16 with nearest rounding, and nearly all of them in FP8 and FP4. In BF16, nearest rounding can never move the second moment down, so it cannot follow gradients that shrink. Across seven models, from LLaMA-60M to LLaMA-7B, the prediction is <strong>within 2.8 percentage points</strong> of the measured value.</li>
+<li>Stalling costs loss. On LLaMA-100M, <strong>stochastic rounding plus periodic state resets</strong> lowers the validation loss with FP8 states from 3.33 to 3.22, and lets BF16 and FP8 states match FP32 states while using half or a quarter of the memory.</li>
+<li>Stochastic rounding from FP32 to BF16 takes one integer addition of a random number and one mask. Written as a <strong>Triton kernel</strong>, it is about 36× faster than plain PyTorch and costs less than 1% more than the same kernel with nearest rounding.</li>
+</ul>
+</div>
+
+<figure class="wide">
+<div class="fig">
+<div class="plot" id="f1-plot"></div>
+<div class="controls" id="f1-ctrl"></div>
+<div class="mini" id="f1-mini"></div>
+</div>
+<figcaption><b>Figure 1. A small update, added 96 times.</b> Each addition is computed in FP32 and stored in BF16, starting from 1.25. Below half a grid step (0.5 ULP), nearest rounding never moves the state. Each purple path uses stochastic rounding with a different seed, and it still climbs. The grid step changes when a path crosses a power of two.</figcaption>
+</figure>
+
+<div class="outline">
+<h4>Outline</h4>
+<ol>
+<li><a href="#sec-stalling">Small updates can vanish</a></li>
+<li><a href="#sec-nearest">Nearest rounding has a threshold</a></li>
+<li><a href="#sec-stochastic">Stochastic rounding keeps small updates on average</a></li>
+<li><a href="#sec-evidence">The prediction matches training</a></li>
+<li><a href="#sec-training">What stalling does to training</a></li>
+<li><a href="#sec-pytorch">Stochastic rounding in PyTorch</a></li>
+<li><a href="#sec-triton">A short introduction to Triton</a></li>
+<li><a href="#sec-speed">How fast is it?</a></li>
+<li><a href="#sec-conclusion">Conclusion</a></li>
+</ol>
+</div>
+
+<!-- ================================================================ 1 -->
+<h2 id="sec-stalling"><span class="num">1</span>Small updates can vanish</h2>
+
+<p>Add a small positive number to a stored value, over and over. With exact arithmetic the additions pile up. In low precision, each new value can be so close to the old one that rounding puts it right back. The next step starts from the same stored value, so the lost pieces never add up.</p>
+<p>This is <strong>state-update stalling</strong>: the optimizer computes an update, but the stored state does not change. Figure 1 shows it with repeated BF16 additions. The purple paths use stochastic rounding, which Section 3 explains.</p>
+
+<h3 id="ema">1.1 The optimizer has a memory</h3>
+<p>Adam keeps two running averages (EMAs) for every parameter<sup class="fn"><a href="#ref-adam">[2]</a></sup>: the first moment $m_t$, an average of the gradients, and the second moment <span class="nw">$v_t$,</span> an average of the squared gradients:</p>
+$$m_t=\beta_1 m_{t-1}+(1-\beta_1)g_t,\qquad v_t=\beta_2 v_{t-1}+(1-\beta_2)g_t^2.$$
+<p>Both move by small steps, and both can stall in the same way. This post focuses on the second moment, because it allows a simple closed-form analysis. Its update is driven by $g_t^2$, and the stored value has the same scale as $g_t^2$, so the scale cancels and the chance of stalling depends mostly on the number format and $\beta_2$ (Section 2).</p>
+<p>Write $v^q_{t-1}$ for one coordinate of the second moment, stored in low precision, and $\widetilde v_t$ for the new value computed in full precision:</p>
+$$\widetilde v_t=\beta_2 v^q_{t-1}+(1-\beta_2)g_t^2,\qquad v_t^q=Q(\widetilde v_t).$$
+<p>Reading the stored value into FP32 is exact, so new error only enters when the result is written back. Compared with the stored value, the new value moves by</p>
+$$\Delta_t=\widetilde v_t-v^q_{t-1}=(1-\beta_2)\big(g_t^2-v^q_{t-1}\big).$$
+<p>With $\beta_2=0.999$, only a thousandth of the difference between the new squared gradient and the stored value reaches the update. In low precision that is often smaller than the gap to the next representable number. A long memory and a coarse grid are a bad combination.</p>
+<p>This model only looks at the rounding when the state is written back; the arithmetic itself is treated as exact. "Stalled" means that one coordinate of the state did not change, not that training stopped.</p>
+
+<!-- ================================================================ 2 -->
+<h2 id="sec-nearest"><span class="num">2</span>Nearest rounding has a threshold</h2>
+
+<p>Let $u$ be the distance between neighbouring representable values near the stored value, also called one unit in the last place (ULP). Nearest rounding returns to the stored value whenever</p>
+$$\boxed{\,|\Delta_t|&lt;\tfrac{u}{2}\,}.$$
+<p>Half a ULP is the threshold. An update below it is lost, and the next one starts from the same place.</p>
+
+<h3>2.1 How big is one ULP?</h3>
+<p>For a positive value $v=m2^e$ with mantissa $m\in[1,2)$ and $p$ stored fraction bits, the spacing is</p>
+$$u=2^{e-p}=\frac{\varepsilon}{m}\,v,\qquad \varepsilon=2^{-p}.$$
+<div class="wide tables">
+<table class="tbl">
+<thead><tr><th>State format</th><th>Fraction bits</th><th>$\varepsilon$</th></tr></thead>
+<tbody>
+<tr><td>BF16</td><td>7</td><td>1 / 128</td></tr>
+<tr><td>FP8 · E4M3</td><td>3</td><td>1 / 8</td></tr>
+<tr><td>FP4 · unsigned E2M2</td><td>2</td><td>1 / 4</td></tr>
+</tbody>
+</table>
+<p class="tcap"><b>Table 1.</b> Fraction bits and resolution of the three formats.</p>
+</div>
+<p>At the same scale, an FP8 grid is 16 times coarser than BF16, and this FP4 grid is 32 times coarser. The FP4 format here is unsigned E2M2, for a state that is never negative; it is not the signed E2M1 format. The spacing changes at powers of two, and exact ties depend on the last kept bit; the model ignores these edge cases.</p>
+
+<h3 id="stuck">2.2 A second moment that can only go up</h3>
+<p>Put the two together for Adam in BF16. Near a value $v$ the grid step is $u=v/(128m)$ with $m\in[1,2)$, so half a step is more than $v/512$. With $\beta_2=0.999$, the largest possible downward update, when $g_t=0$, is only $0.001\,v$. That is always below the threshold. <strong>With nearest rounding, the stored second moment can never decrease.</strong></p>
+<p>If the gradients get smaller at some point in training, the state stays at its old value, and Adam keeps dividing by a number that is too large, which shrinks its steps. In BF16 the state can still move up when a large squared gradient arrives, so it slowly drifts upward. FP8 is more extreme: half a step is more than $v/32$, and even an upward move needs a squared gradient more than about 30 times the stored value, so the state barely moves at all. Figure 2 simulates both.</p>
+<p>This depends on $\beta_2$. The argument needs $1-\beta_2&lt;1/512$, so in BF16 it holds for $\beta_2$ above about 0.998. With a shorter memory, such as 0.99, large downward updates do get through. In FP8 the condition is $1-\beta_2&lt;1/32$, so it holds for $\beta_2$ above about 0.97.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f2-ctrl"></div>
+<div class="plot" id="f2-plot"></div>
+<div class="mini" id="f2-mini"></div>
+</div>
+<figcaption><b>Figure 2. Adam's second moment in low precision.</b> A simulation with $\beta_2=0.999$ on 64 coordinates, starting from a state that has already settled at the gradient variance, as later in training. The gradients are Gaussian, and at step 2,000 their variance drops from 1 to 0.25 (gray). The curves show the stored second moment, averaged over the coordinates. At $\beta_2=0.999$, nearest rounding (red) never goes down, in BF16 or FP8, while stochastic rounding (purple) follows the FP32 state on average. With a shorter memory ($\beta_2=0.99$ or $0.95$), nearest rounding in BF16 follows the drop again, but in FP8 it stays far above the true value even at 0.95. At 0.9999 nearest rounding does not move at all, and even the FP32 state adapts slowly. FP8 here has 3 fraction bits and no limit on the exponent, as with per-tensor scaling.</figcaption>
+</figure>
+
+<h3 id="predictor">2.3 From the threshold to a probability</h3>
+<p>To turn the threshold into a probability, model one gradient coordinate over a short window as Gaussian, $g_t/\sigma\approx\mathcal N(0,1)$, with the state near its typical value, $v^q_{t-1}\approx\sigma^2$. Then</p>
+$$z_t:=g_t^2/\sigma^2\sim\chi_1^2,\qquad \Delta_t\approx(1-\beta_2)\sigma^2(z_t-1).$$
+<p>The mantissa $m$ changes from coordinate to coordinate. Replace it by a typical value, $\bar m=1/\ln 2$. The ratio of update size to grid spacing then depends on a single number,</p>
+$$\widehat\rho:=\frac{\varepsilon}{2(1-\beta_2)\bar m},\qquad \frac{|\Delta_t|}{u}\approx\frac{|z_t-1|}{2\widehat\rho}.$$
+<p>An update stalls when $|z_t-1|&lt;\widehat\rho$, and the probability of that is</p>
+<div class="theorem"><div class="lbl">Nearest rounding</div>
+$$P_{\mathrm{stall}}^{\mathrm{NR}}\approx F_{\chi_1^2}(1+\widehat\rho)-F_{\chi_1^2}\!\big(\max(0,1-\widehat\rho)\big).$$
+</div>
+<details><summary>Where the formula comes from</summary>
+<p>If the mantissa is spread evenly on a log scale, its density is $f(m)=1/(m\ln 2)$ on $[1,2)$ and its mean is $1/\ln 2$. Using the mean inside the formula is an approximation: the probability at the average mantissa is not exactly the average probability.</p>
+<p>For $a\sim\mathcal N(0,1)$, $a^2\sim\chi_1^2$, so for $x\ge0$</p>
+$$F_{\chi_1^2}(x)=\Pr(-\sqrt{x}\le a\le\sqrt{x})=2\Phi(\sqrt{x})-1=\operatorname{erf}\!\big(\sqrt{x/2}\big).$$
+<p>The lower end is clipped at zero because a squared gradient cannot be negative.</p>
+</details>
+<p><strong>The gradient scale cancels.</strong> Both the update and the grid spacing grow with $\sigma^2$, so their ratio does not depend on it. The prediction depends only on the precision $\varepsilon$ and the decay $\beta_2$, not on the model size or the size of the gradients. That makes it easy to test on very different models (Section 4).</p>
+<p>Push $\beta_2$ toward one, or remove fraction bits, and the stalling interval grows. Figure 3 shows the effect. The purple curve is stochastic rounding, covered in the next section.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f3-ctrl"></div>
+<div class="plot" id="f3-plot"></div>
+<div class="mini" id="f3-mini"></div>
+<div class="controls" id="f3-ctrl2"></div>
+<details><summary>See the probability mass behind this prediction</summary>
+<div class="controls" id="f3d-ctrl"></div>
+<div class="plot" id="f3d-plot"></div>
+<p class="mini" id="f3d-mini"></p>
+</details>
+</div>
+<figcaption><b>Figure 3. Less precision, more stalling.</b> Predicted fraction of stalled updates against the decay $\beta_2=1-10^{-k}$, for the formats of Table 1. These are the model's predictions, not measurements. The expandable panel shows the normal density weighted by the stall condition; the shaded area is the same probability.</figcaption>
+</figure>
+
+<p>At $\beta_2=0.999$ the prediction is about <strong>94.6% for BF16</strong> and almost <strong>100% for FP8 and FP4</strong>. The model leaves out clipping, very small numbers (subnormals), the start of training and changing gradient scales.</p>
+
+<!-- ================================================================ 3 -->
+<h2 id="sec-stochastic"><span class="num">3</span>Stochastic rounding keeps small updates on average</h2>
+
+<p>Take two neighbouring representable values $q_-&lt;x&lt;q_+$. Nearest rounding always picks the closer one. Stochastic rounding picks the upper one with probability equal to how far $x$ is across the gap<sup class="fn"><a href="#ref-croci">[3]</a></sup>:</p>
+$$p(x)=\frac{x-q_-}{q_+-q_-},\qquad Q_{\mathrm{SR}}(x)=\begin{cases}q_+ &amp; \text{with probability }p(x),\\ q_- &amp; \text{with probability }1-p(x).\end{cases}$$
+<p>A value 30% of the way across rounds up 30% of the time. A value that is already representable stays as it is. Figure 4 shows this with repeated draws.</p>
+
+<figure class="wide">
+<div class="fig">
+<div id="f4-body"></div>
+<div class="controls" id="f4-ctrl"></div>
+</div>
+<figcaption><b>Figure 4. Distance becomes probability.</b> Single draws are noisy; their average gets closer to the input as more draws are added. The purple marker is the input and the dark marker is the average of the draws, which come from the same counter hash as the kernel later in the post. The error $\sqrt{p(1-p)/n}$ assumes independent draws.</figcaption>
+</figure>
+
+<h3>3.1 Unbiased in every step</h3>
+<p>For each rounding, the expected result is the input itself:</p>
+$$\mathbb E[Q_{\mathrm{SR}}(x)\mid x]=(1-p)\,q_-+p\,q_+=x.$$
+<p>The price is noise: the variance of one rounding is $(x-q_-)(q_+-x)$<sup class="fn"><a href="#ref-croci">[3]</a></sup>. This holds for each rounding on its own. It does not make a whole training run through a nonlinear optimizer unbiased.</p>
+<details><summary>Why the average state stays correct</summary>
+<p>Fix a sequence of gradients $g_1,\ldots,g_t$ and a representable starting state. Assume exact arithmetic, no clipping, and unbiased rounding at every write. Let $v_t$ be the average computed without any rounding. Then $\mathbb E[v_t^q]=v_t$, because each write is unbiased given everything before it:</p>
+$$\mathbb E[v_t^q\mid\mathcal F_{t-1}]=\beta_2v_{t-1}^q+(1-\beta_2)g_t^2.$$
+<p>Taking expectations and repeating the step back to the start gives the result. The state is correct on average even if most writes leave it unchanged. A full Adam run is more complicated, because the update divides by a function of the random state and later gradients depend on earlier steps.</p>
+</details>
+
+<h3>3.2 Stochastic rounding still stalls</h3>
+<p>If an update is smaller than one grid step, stochastic rounding leaves the state unchanged with probability $1-|\Delta|/u$. Only updates of a full step or more always move it. Averaging over the same gradient model gives</p>
+<div class="theorem"><div class="lbl">Stochastic rounding</div>
+$$p_{\mathrm{stall}}^{\mathrm{SR}}(z;\widehat\rho)=\max\!\Big(0,\,1-\frac{|z-1|}{2\widehat\rho}\Big),\qquad P_{\mathrm{stall}}^{\mathrm{SR}}\approx\mathbb E_{z\sim\chi_1^2}\!\big[p_{\mathrm{stall}}^{\mathrm{SR}}(z;\widehat\rho)\big].$$
+</div>
+<p>At $\beta_2=0.999$ this still predicts about 82.5% stalled updates in BF16, 98.9% in FP8 and 99.4% in FP4. A small chance of moving helps, but in very low precision that chance is small.</p>
+
+<h3 id="bias">3.3 Stalled is not the same as biased</h3>
+<p>Take an update of $0.2u$. Nearest rounding always delivers zero. Stochastic rounding also delivers zero 80% of the time, but the other 20% of the time it moves a full step $u$, so on average it delivers exactly $0.2u$.</p>
+<p>A high stalled fraction alone therefore does not mean stochastic rounding behaves like nearest rounding. The updates that get through are larger, and on average they point the right way.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="plot" id="f5-plot"></div>
+<div class="controls" id="f5-ctrl"></div>
+<div class="mini" id="f5-mini"></div>
+</div>
+<figcaption><b>Figure 5. A state that rarely moves can still be unbiased.</b> The shaded region is where nearest rounding stalls. Stochastic rounding keeps the right average by pairing frequent zero updates with occasional full steps. MSE is the mean squared error of the delivered update: nearest rounding has the smallest error in a single step, and stochastic rounding gives that up to stay unbiased.</figcaption>
+</figure>
+
+<p>Above half a step the picture flips, as Figure 5 shows: nearest rounding moves every time, while stochastic rounding sometimes stays put. Stochastic rounding does not always stall less; what it guarantees is the correct average. This is also why the two curves in Figure 3 can cross.</p>
+<details><summary>Why stochastic rounding helps even when almost everything stalls</summary>
+<p>In the model, the fraction of updates that move under stochastic rounding is</p>
+$$1-P_{\mathrm{stall}}^{\mathrm{SR}}(\widehat\rho)=\mathbb E\!\Big[\min\!\Big(1,\frac{|z-1|}{2\widehat\rho}\Big)\Big],\qquad z\sim\chi_1^2.$$
+<p>As $\widehat\rho$ grows (coarser grids or longer memories),</p>
+$$\lim_{\widehat\rho\to\infty}\widehat\rho\big(1-P_{\mathrm{stall}}^{\mathrm{SR}}(\widehat\rho)\big)=\frac{\mathbb E|z-1|}{2}=2\phi(1)\approx0.48394,$$
+<p>where $\phi$ is the standard normal density. So the moving fraction under stochastic rounding shrinks like $1/\widehat\rho$. Under nearest rounding, for $\widehat\rho\ge1$, it is the Gaussian tail $2[1-\Phi(\sqrt{1+\widehat\rho})]$, which shrinks exponentially. Both stalled fractions can look close to 100% while one method still moves the state far more often than the other.</p>
+</details>
+<details><summary>How long until a small update gets through?</summary>
+<p>Fix a uniform grid and a constant update $0&lt;\delta&lt;u/2$. Nearest rounding never moves. Stochastic rounding moves with probability $p=\delta/u$ at each attempt, so with independent draws the number of attempts $T$ until the first move is geometric:</p>
+$$\Pr(T&gt;k)=(1-p)^k,\qquad\mathbb E[T]=\frac{u}{\delta}.$$
+<p>For $\delta=0.2u$ that is five attempts on average. In a real optimizer the update and the grid change over time, so this is only a guide.</p>
+</details>
+
+<!-- ================================================================ 4 -->
+<h2 id="sec-evidence"><span class="num">4</span>The prediction matches training</h2>
+
+<p>The model throws away almost everything about the network: architecture, data and size. It keeps only the format, the rounding mode and $\beta_2$. If it is right, one prediction per format and rounding mode should match many different models.</p>
+<p>Figure 6 compares the prediction with the stalled fraction measured during training, for seven models at $\beta_2=0.999$<sup class="fn"><a href="#ref-paper">[1]</a></sup>. Each dot is a measurement and each dashed line is the prediction. The prediction stays within 2.8 percentage points of every measurement.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f6-ctrl"></div>
+<div class="mini" id="f6-summary"></div>
+<div id="f6-body"></div>
+</div>
+<figcaption><b>Figure 6. One prediction, many models.</b> Measured stalled fraction for LLaMA models from 60M to 7B parameters, two GPT-NeoX models and a mixture-of-experts model, against the prediction (dashed). The 1B and 7B LLaMA runs, marked with an asterisk, are short runs of a few thousand steps, which is long enough for the stalled fraction to settle.</figcaption>
+</figure>
+
+<!-- ================================================================ 5 -->
+<h2 id="sec-training"><span class="num">5</span>What stalling does to training</h2>
+
+<p>Stalling is measured one state coordinate at a time. Does it matter for the model? In the paper we pretrain LLaMA models on C4 with the optimizer states stored in BF16, FP8 or FP4<sup class="fn"><a href="#ref-paper">[1]</a></sup>; the model weights and activations are in BF16. We compare plain AdamW with AdamW plus two fixes: stochastic rounding, and periodic resets of the states. For the 100M-parameter model, the two fixes lower the final validation loss from 3.27 to 3.21 with BF16 states, from 3.33 to 3.22 with FP8 states, and from 3.32 to 3.26 with FP4 states.</p>
+
+
+<p><strong>Why resets help.</strong> Stalling gets worse as a state ages. Right after it starts from zero, the second moment is small, so new squared gradients are large compared with its grid spacing and the updates go through. As the state grows, more and more updates fall under the threshold. A reset sets the moments back to zero, which restarts this cycle and lets a state that got stuck high, as in Figure 2, come back down. The stalling model gives the reset period: about every 1000 steps for BF16, 300 for FP8 and 200 for FP4. The cost is that a reset throws away what the state had averaged.</p>
+<p>Table 2 separates the two fixes. Here the model itself trains in FP32 and only the optimizer states are stored in low precision, so any difference comes from the states.</p>
+<div class="wide tables">
+<table class="tbl">
+<thead><tr><th></th><th>FP32 states</th><th>BF16</th><th>FP8</th><th>FP4</th></tr></thead>
+<tbody>
+<tr><td>nearest rounding</td><td>3.155</td><td>3.181</td><td>3.193</td><td>3.199</td></tr>
+<tr><td>stochastic rounding</td><td>–</td><td>3.156</td><td>3.160</td><td>3.182</td></tr>
+<tr><td>resets only</td><td>3.161</td><td>3.158</td><td>3.159</td><td>3.166</td></tr>
+<tr><td>stochastic rounding + resets</td><td>–</td><td class="hi">3.155</td><td class="hi">3.155</td><td class="hi">3.160</td></tr>
+<tr class="grp"><td>state memory saved</td><td>0%</td><td>50%</td><td>75%</td><td>87.5%</td></tr>
+</tbody>
+</table>
+<p class="tcap"><b>Table 2.</b> Final validation loss of LLaMA-100M when only the optimizer states are stored in low precision. Lower is better.</p>
+</div>
+<p>Three things stand out. Stochastic rounding alone closes most of the gap in BF16 and FP8. With stochastic rounding and resets together, BF16 and FP8 states reach the same loss as FP32 states, 3.155, with half or a quarter of the memory. And resets slightly hurt with FP32 states (3.161 against 3.155), so they help because low-precision states go stale, not because resets are good in general.</p>
+
+<!-- ================================================================ 6 -->
+<h2 id="sec-pytorch"><span class="num">6</span>Stochastic rounding in PyTorch</h2>
+
+<p><strong>How do we implement it, and is it worth the time?</strong> Section 5 shows what stochastic rounding gains in loss. Nearest rounding needs no extra work: the cast to BF16 is built into PyTorch and the GPU. Stochastic rounding is not, so we have to write it ourselves. Written directly in PyTorch, it takes about 70 times longer than the built-in nearest cast on an H200 (Section 8). At that cost, the better loss comes with a much slower optimizer step.</p>
+<p>The rounding itself is only a few integer operations per element. The time goes into moving the tensor through memory, once for every PyTorch operation. If all the steps run in a single kernel, the tensor is read and written once, and stochastic rounding costs almost the same as nearest rounding in the same kernel. Inside a fused AdamW step the difference is about 0.3%.</p>
+<p>The rest of the post shows how to get there. We start with a standalone cast from FP32 to BF16 in PyTorch, to see what has to be computed, and then write it as a single kernel in Triton. Section 8.1 puts the same rounding inside an optimizer step. The code follows our implementation<sup class="fn"><a href="#ref-source">[4]</a></sup>, simplified in a few places.</p>
+<p>Nearest rounding is one line, <code>x.to(torch.bfloat16)</code>. Stochastic rounding has to choose between two BF16 neighbours, so it takes a few more steps:</p>
+<div class="steps" id="c1-tabs"></div>
+<div class="code" id="c1"></div>
+<p>The idea is to read the FP32 bits as an integer, add a random 16-bit number, and clear the low 16 bits. The lines with <code>special</code> keep infinities and NaNs intact. This works, but on a GPU each PyTorch operation here is a separate kernel that reads and writes the whole tensor, so the data makes many trips through memory instead of one. This is the gap that a single Triton kernel closes.</p>
+
+<h3 id="bits">6.1 Why the low 16 bits are enough</h3>
+<p>FP32 has 1 sign bit, 8 exponent bits and 23 fraction bits. BF16 keeps the sign, the exponent and the first 7 fraction bits. The 16 bits it drops tell you where the FP32 value sits between its two BF16 neighbours.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f7-ctrl"></div>
+<div id="f7-body"></div>
+<div class="controls" id="f7-ctrl2"></div>
+<div class="mini" id="f7-mini"></div>
+</div>
+<figcaption><b>Figure 7. The probability is already in the bits.</b> A carry happens when low + random ≥ 65,536, which is true for exactly "low" of the 65,536 possible random values. A carry rounds away from zero: up for positive numbers, down for negative ones. The bitcast reads the same 32 bits as an integer; it does not convert the number.</figcaption>
+</figure>
+
+<p>Let $\ell$ be the integer formed by the 16 dropped bits. Add a uniform random integer $r\in\{0,\ldots,2^{16}-1\}$ to the FP32 word and clear the low 16 bits. A carry into the kept bits happens exactly when $\ell+r\ge 2^{16}$, which is true for $\ell$ of the $2^{16}$ possible values of $r$:</p>
+$$\Pr(\text{carry})=\frac{\ell}{2^{16}}.$$
+<p>A carry moves away from zero, so this is the stochastic rounding rule for both positive and negative numbers. Exact BF16 values have $\ell=0$ and never carry.</p>
+
+<!-- ================================================================ 7 -->
+<h2 id="sec-triton"><span class="num">7</span>A short introduction to Triton</h2>
+
+<p>Triton lets you write GPU kernels in Python<sup class="fn"><a href="#ref-triton-vector">[5]</a></sup>. Instead of writing code for a single GPU thread, you write a <strong>program</strong> that works on a whole block of elements at once, and Triton decides how to spread that work over the threads.</p>
+<p>For $N$ elements and block size $B$, you launch $\lceil N/B\rceil$ copies of the program, and copy $j$ handles elements $jB$ to $jB+B-1$. Each element slot of a block is called a <strong>lane</strong>. The last block can run past the end of the tensor, so a <strong>mask</strong> switches off the lanes past the end.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f8-ctrl"></div>
+<div class="budget" id="f8-budget"></div>
+<div id="f8-body"></div>
+<div class="keq" id="f8-eq"></div>
+</div>
+<figcaption><b>Figure 8. Think in blocks.</b> Each program handles one block of the tensor. Hatched lanes are past the end of the tensor, so the masked loads and stores skip them. Real kernels use much larger blocks, for example 256 elements.</figcaption>
+</figure>
+
+<h3 id="kernel">7.1 The kernel</h3>
+<p>A Triton kernel is a Python function marked with <code>@triton.jit</code>. Ours has five steps: find this program's elements, load them, give each one a counter for its random number, round, and store.</p>
+<div class="steps" id="c2-steps"></div>
+<p class="stepx" id="c2-x"></p>
+<div class="code" id="c2"></div>
+<p>To run it, allocate the output and launch one program per block. The <code>grid</code> says how many programs to start:</p>
+<div class="code" id="c3"></div>
+<p><code>kernel[grid](...)</code> is how Triton launches a kernel. The grid in square brackets sets how many programs run: here a one-element tuple, one program per block, and <code>tl.program_id(0)</code> tells each program its position. The call then passes the arguments. Tensors arrive in the kernel as pointers to their first element, which is why the kernel names them <code>input_ptr</code> and <code>output_ptr</code>, and numbers are passed as they are. <code>BLOCK_SIZE</code> is declared <code>tl.constexpr</code>, so it is fixed when the kernel is compiled, and Triton compiles one version per block size.</p>
+
+<h3 id="rounding-helper">7.2 The rounding helpers</h3>
+<p>The rounding is the bit trick from Figure 7. It lives in two small helpers, which the kernel calls like ordinary functions. <code>_stochastic_bf16_bits</code> returns the chosen 32-bit word, and <code>_stochastic_bf16_value</code> reads it back as an FP32 number.</p>
+<p>The random number comes from a third helper, <code>_u32_hash</code>. It is a hash, not a random number generator with a state: it mixes the bits of the counter with shifts, XORs and two multiplications by large constants, so that neighbouring counters give numbers that look unrelated. The same counter always gives the same number. Nothing has to be stored between calls, and every element computes its own random number on its own. The rounding keeps the low 16 bits of the hash as the random number $r$ from Section 6.1.</p>
+<div class="steps" id="c4-steps"></div>
+<p class="stepx" id="c4-x"></p>
+<div class="code" id="c4"></div>
+<p><strong>A bitcast is not a numeric cast.</strong> <code>tl.cast(value, tl.uint32, bitcast=True)</code> reads the same 32 bits as an integer. Without <code>bitcast=True</code>, Triton converts the number itself, so 1.25 would become 1<sup class="fn"><a href="#ref-triton-cast">[6]</a></sup>.</p>
+<details><summary>What the hexadecimal masks mean</summary>
+<table class="tbl"><thead><tr><th>Mask</th><th style="text-align:left">Meaning</th></tr></thead><tbody>
+<tr><td><code>0xFFFF0000</code></td><td style="text-align:left">Keep the sign, the exponent and the top 7 fraction bits.</td></tr>
+<tr><td><code>0x0000FFFF</code></td><td style="text-align:left">Keep a 16-bit random number, 0 to 65,535.</td></tr>
+<tr><td><code>0x7F800000</code></td><td style="text-align:left">Select the 8 exponent bits.</td></tr>
+<tr><td><code>0x007FFFFF</code></td><td style="text-align:left">Select the 23 FP32 fraction bits.</td></tr>
+<tr><td><code>0x00400000</code></td><td style="text-align:left">Set a NaN bit that BF16 keeps.</td></tr>
+</tbody></table>
+</details>
+
+<h3>7.3 Two things to get right</h3>
+<p><strong>Tie the random number to the element, not the program.</strong> The counter is built from the element's index plus a seed and an offset. Because it does not depend on the program, changing the block size does not change the result, and the same seed and offset always give the same rounding. Use a new offset for each new cast so the random numbers change.</p>
+<p><strong>Mask the loads and stores themselves.</strong> An out-of-range load has already happened by the time a later <code>tl.where</code> throws its value away. Pass <code>mask=mask</code> to <code>tl.load</code> and <code>tl.store</code>.</p>
+
+<!-- ================================================================ 8 -->
+<h2 id="sec-speed"><span class="num">8</span>How fast is it?</h2>
+
+<p>Figure 9 compares three ways to run the same stochastic rounding on an NVIDIA H200: eager PyTorch (the code from Section 6), the same code compiled with <code>torch.compile</code>, and the Triton kernel. It also shows the same Triton kernel with nearest rounding, to isolate the cost of the randomness.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f10-ctrl"></div>
+<div class="plot" id="f10-plot"></div>
+<div class="mini" id="f10-mini"></div>
+</div>
+<figcaption><b>Figure 9. Time per call, log scale.</b> NVIDIA H200 with PyTorch 2.11 and Triton 3.6. The cast rounds 16,777,216 FP32 values to BF16 (CUDA-event time). The optimizer steps update one tensor of 16,777,216 FP32 parameters whose states are stored in BF16 (wall-clock time). Medians from the benchmarks in our implementation<sup class="fn"><a href="#ref-source">[4]</a></sup>.</figcaption>
+</figure>
+
+<p>For the cast, the Triton kernel is about 36 times faster than eager PyTorch and about twice as fast as <code>torch.compile</code>. It is also less than 1% slower than the same kernel with nearest rounding, so the randomness is almost free; the kernel spends its time moving data, not on the extra integer operations. PyTorch's built-in nearest cast is about twice as fast again, so a more carefully tuned kernel still has room to improve.</p>
+
+<h3 id="optimizers">8.1 Inside an optimizer</h3>
+<p>In an optimizer, the rounding belongs inside the update step, so that each tensor is read and written only once. The kernel below is a complete AdamW step for one block of a parameter tensor. It keeps both moments in BF16 and rounds them with the same helper as the cast.</p>
+<div class="steps" id="c13-steps"></div>
+<p class="stepx" id="c13-x"></p>
+<div class="code" id="c13"></div>
+<p>It is launched like the cast, with one program per block of the parameter tensor. Figure 9 also times this step. The fused step with stochastic rounding is about 2.6 times faster than the same step compiled from PyTorch, and stochastic rounding adds about 0.3% over nearest rounding.</p>
+
+<!-- ================================================================ 9 -->
+<h2 id="sec-conclusion"><span class="num">9</span>Conclusion</h2>
+<p>Storing optimizer states in low precision does more than add noise: it can stop a state from changing at all. An update smaller than half a grid step is rounded away, and with Adam's long memory that is true for most updates in BF16 and nearly all in FP8 and FP4. In BF16 the second moment cannot even go down. A model that only knows the format and $\beta_2$ predicts how often this happens, and it matches measurements from seven different models.</p>
+<p>The fixes are simple. Stochastic rounding keeps every update correct on average, and periodic resets stop the states from going stale. Together they bring LLaMA-100M with BF16 or FP8 states to the same loss as FP32 states. Stochastic rounding is also cheap: in a Triton kernel it is one addition of a random number and one mask per element, and it costs less than 1% more than the same kernel with nearest rounding.</p>
+<p>The paper has the full analysis, including how to choose the reset period and results at larger scales<sup class="fn"><a href="#ref-paper">[1]</a></sup>. The code is in our implementation<sup class="fn"><a href="#ref-source">[4]</a></sup>.</p>
+
+<hr>
+
+<h2 id="refs">References</h2>
+<ol class="refs">
+<li id="ref-paper">K. Topollai, A. Choromanska. <em>Understanding Quantization of Optimizer States in LLM Pre-training: Dynamics of State Staleness and Effectiveness of State Resets.</em> EMNLP 2026. <a href="https://arxiv.org/abs/2603.16731">arXiv:2603.16731</a>.</li>
+<li id="ref-adam">D. P. Kingma, J. Ba. <em>Adam: A Method for Stochastic Optimization.</em> ICLR 2015. <a href="https://arxiv.org/abs/1412.6980">arXiv:1412.6980</a>.</li>
+<li id="ref-croci">M. Croci, M. Fasi, N. J. Higham, T. Mary, M. Mikaitis. <em>Stochastic rounding: implementation, error analysis and applications.</em> Royal Society Open Science, 2022. <a href="https://doi.org/10.1098/rsos.211631">doi:10.1098/rsos.211631</a>.</li>
+<li id="ref-source">K. Topollai. <em>Stochastic Rounding for PyTorch</em> (sr-states 0.1.0). <a href="https://github.com/KristiTopollai/stochastic-rounding-pytorch">github.com/KristiTopollai/stochastic-rounding-pytorch</a>. The code in this post follows commit <a href="https://github.com/KristiTopollai/stochastic-rounding-pytorch/tree/69d7ccb">69d7ccb</a>.</li>
+<li id="ref-triton-vector">Triton documentation. <em>Vector Addition.</em> <a href="https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html">triton-lang.org</a>.</li>
+<li id="ref-triton-cast">Triton documentation. <em>triton.language.cast.</em> <a href="https://triton-lang.org/main/python-api/generated/triton.language.cast.html">triton-lang.org</a>.</li>
+</ol>
+
+<h2 id="cite">Citation</h2>
+<p>To cite the results, please cite the paper<sup class="fn"><a href="#ref-paper">[1]</a></sup>:</p>
+<div class="bib" data-paper="emnlp26"><button class="cp">copy</button><pre></pre></div>
+<p>To cite this post:</p>
+<div class="bib"><button class="cp">copy</button><pre>@misc{topollai2026smallupdates,
+  title        = {When Small Updates Disappear},
+  author       = {Topollai, Kristi},
+  year         = {2026},
+  month        = {September},
+  howpublished = {Blog post},
+  url          = {https://kristitopollai.github.io/blog/quantization/}
+}</pre></div>
+
+<footer>Kristi Topollai · September 2026 · <a href="../../">back to the site</a></footer>
+</article>
+</div>
+
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.35.3/plotly.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/contrib/auto-render.min.js"></script>
+<script src="app.js?v=20261003p"></script>
+<script src="../../data/papers.js?v=20261003p"></script>
+<script src="../cite.js?v=20261003p"></script>
+</body>
+</html>

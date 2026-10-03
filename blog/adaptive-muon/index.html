@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adaptive Newton–Schulz via Spectral Estimation</title>
+<meta name="description" content="Newton–Schulz can measure the singular-value distribution of its own input. Spectral moments for free, a maximum-entropy moment fit, and a Polar Express routine selected for each matrix.">
+<link rel="canonical" href="https://kristitopollai.github.io/blog/adaptive-muon/">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://kristitopollai.github.io/blog/adaptive-muon/">
+<meta property="og:title" content="Adaptive Newton–Schulz via Spectral Estimation">
+<meta property="og:description" content="Newton–Schulz can measure the singular-value distribution of its own input. Spectral moments for free, a maximum-entropy moment fit, and a Polar Express routine selected for each matrix.">
+<meta property="og:image" content="https://kristitopollai.github.io/assets/portrait.jpg">
+<meta name="twitter:card" content="summary">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Ccircle cx=%278%27 cy=%278%27 r=%277%27 fill=%27%236d4bd6%27/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&family=Martian+Mono:wdth,wght@75..112.5,400..800&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.css">
+<link rel="stylesheet" href="../notes.css?v=20261003m">
+<link rel="stylesheet" href="style.css?v=20261003m">
+</head>
+<body>
+
+<div class="topbar"><div class="in">
+  <a class="brand" href="../../">~/kristi-topollai/notes</a>
+  <nav><a href="#sec-results">Results</a><a href="https://arxiv.org/abs/2609.33047">Paper</a></nav>
+</div><div class="progress"></div></div>
+
+<div class="page">
+<aside class="toc">
+  <div class="h">Contents</div>
+  <a href="#tldr">TL;DR</a>
+  <a href="#sec-muon">1. Muon and Newton–Schulz</a>
+  <a href="#sec-ell">2. The design interval</a>
+  <a href="#sec-sensor">3. Newton–Schulz measures its input</a>
+  <a href="#sec-estimator">4. Fitting a spectrum to the moments</a>
+  <a class="sub" href="#sec-fit">4.1 A maximum-entropy moment fit</a>
+  <a class="sub" href="#sec-ranges">4.2 What the fit can predict</a>
+  <a href="#sec-dict">5. Selecting a Polar Express routine</a>
+  <a class="sub" href="#sec-dict-a">5.1 The candidate set</a>
+  <a class="sub" href="#sec-dict-b">5.2 Scoring each candidate</a>
+  <a class="sub" href="#sec-dict-c">5.3 Fixed-depth and target rules</a>
+  <a href="#sec-drift">6. Spectra across layers and training</a>
+  <a href="#sec-adaptive">7. Periodic measurement</a>
+  <a href="#sec-results">8. Results</a>
+  <a class="sub" href="#sec-r1">8.1 Recovering the spectrum</a>
+  <a class="sub" href="#sec-r2">8.2 Fixed depth</a>
+  <a class="sub" href="#sec-r3">8.3 Target accuracy</a>
+  <a href="#sec-takeaways">9. Takeaways</a>
+  <a href="#refs">References</a>
+  <a href="#cite">Citation</a>
+</aside>
+
+<article id="top">
+
+<h1 class="title">Adaptive Newton–Schulz via Spectral Estimation</h1>
+<p class="subtitle">Newton–Schulz can measure the singular-value distribution of its own input</p>
+<p class="byline"><b>Kristi Topollai</b></p>
+<p class="meta">September 2026 · <a href="https://arxiv.org/abs/2609.33047">Paper (arXiv)</a></p>
+
+<p class="companion">This post is a companion to our paper, <a href="https://arxiv.org/abs/2609.33047"><em>Cost-free Spectral Estimation for Adaptive Newton–Schulz in Matrix Optimizers</em></a><sup class="fn"><a href="#ref-paper">[1]</a></sup>.</p>
+
+<div class="tldr" id="tldr">
+<h4>TL;DR</h4>
+<ul>
+<li>Muon orthogonalizes each momentum matrix with a few Newton–Schulz iterations. Polar Express (PE) chooses the coefficients of these iterations for a range of singular values, the <strong>design interval</strong> $[\rho,1]$. Muon does not know where the singular values of its momentum are, so it uses the same conservative interval for every matrix.</li>
+<li>The iterations already compute Gram matrices. A few scalar reductions of these matrices give <strong>spectral moments</strong> of the input, with no extra matrix multiplications.</li>
+<li>A <strong>maximum-entropy moment fit</strong> turns the moments into an estimate of the spectrum. The estimate predicts the RMS error of each candidate PE routine, and we pick the best routine for each matrix.</li>
+<li>Spectra differ between matrix types and layers and change slowly during training. We repeat the measurement periodically and run the fit in the background.</li>
+<li>On saved momentum matrices, <strong>spectral estimation</strong> lowers the RMS error for a fixed number of iterations (90× lower on MLP matrices with five iterations), or reaches the same accuracy with fewer iterations.</li>
+</ul>
+</div>
+
+<div class="outline">
+<h4>Outline</h4>
+<ol>
+<li><a href="#sec-muon">Muon and Newton–Schulz</a></li>
+<li><a href="#sec-ell">The design interval</a></li>
+<li><a href="#sec-sensor">Newton–Schulz measures its own input</a></li>
+<li><a href="#sec-estimator">Fitting a spectrum to the moments</a></li>
+<li><a href="#sec-dict">Selecting a Polar Express routine</a></li>
+<li><a href="#sec-drift">Spectra across layers and training</a></li>
+<li><a href="#sec-adaptive">Periodic measurement</a></li>
+<li><a href="#sec-results">Results</a></li>
+<li><a href="#sec-takeaways">Takeaways</a></li>
+</ol>
+</div>
+
+<!-- ================================================================ 1 -->
+<h2 id="sec-muon"><span class="num">1</span>Muon and Newton–Schulz</h2>
+
+<p>Muon<sup class="fn"><a href="#ref-muon">[2]</a></sup> updates a weight matrix $W$ with the <em>polar factor</em> of its momentum $M$. If $M=U\,\mathrm{diag}(\sigma_i)\,V^\top$ is the SVD of $M$, the polar factor is $\mathrm{polar}(M)=UV^\top$. It is the same matrix with every nonzero singular value set to $1$. The update is</p>
+$$W \leftarrow W-\eta\,UV^\top .$$
+<p>Computing an SVD at every step is too slow. Muon instead runs $K$ Newton–Schulz iterations. It starts from $X_0$, a rescaled copy of $M$ whose singular values $\gamma_i$ lie in $[0,1]$, and repeats</p>
+$$A_j=X_jX_j^\top,\qquad X_{j+1}=a_jX_j+\big(b_jA_j+c_jA_j^2\big)X_j,\qquad j=0,\dots,K-1 .$$
+<p>Each iteration costs three matrix multiplications: $A_j$, $A_j^2$, and the product with $X_j$. The iterations keep the singular vectors $U$ and $V$ and change only the singular values. A singular value $x$ of $X_j$ becomes</p>
+$$p_j(x)=a_jx+b_jx^3+c_jx^5$$
+<p>in $X_{j+1}$. After $K$ iterations each $\gamma_i$ has become $P(\gamma_i)$, where $P=p_{K-1}\circ\dots\circ p_0$ is the <em>response</em> of the routine. So the whole matrix iteration is described by one scalar function. If $P(\gamma_i)\approx1$ for every $i$, then $X_K\approx UV^\top$. Figure 1 shows this on a real momentum matrix.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f1-ctrl"></div>
+<div class="plot" id="f1-plot"></div>
+</div>
+<figcaption><b>Figure 1. A real spectrum being flattened.</b> Singular values of $X_j$ for one momentum matrix (layer 5, step 16k), sorted by the input singular value. Black is the input $X_0$ and violet is $X_j$ after iteration $j$. All routines start from the same $X_0$, scaled with the bound of Section 3. <em>Fixed PE</em> is the conservative Polar Express routine for $[10^{-5},1]$ (Section 2), used for every matrix. The <em>selected</em> routines are the ones spectral estimation picks (Section 5) with the same number of iterations. The ten-iteration routine is the one used for the measurement pass (Section 3). With five iterations, fixed PE leaves most singular values far from $1$, while the selected routine brings every singular value inside its design interval close to $1$.</figcaption>
+</figure>
+
+<!-- ================================================================ 2 -->
+<h2 id="sec-ell"><span class="num">2</span>The design interval</h2>
+
+<p><strong>How Polar Express picks its coefficients.</strong> Polar Express<sup class="fn"><a href="#ref-pe">[3]</a></sup> picks the coefficients one iteration at a time. Suppose we know that the singular values of $X_j$ lie in an interval $[\ell_j,u_j]$, the <em>design interval</em>. At the start this is $[\rho,1]$. The coefficients are those of the odd quintic that stays closest to $1$ on the whole interval:</p>
+$$(a_j,b_j,c_j)=\arg\min_{a,b,c}\ \max_{x\in[\ell_j,u_j]}\big|1-(ax+bx^3+cx^5)\big| ,\qquad e_j=\text{the minimum reached}.$$
+<p>The best polynomial <em>equioscillates</em>. Its error $1-p_j(x)$ reaches $+e_j$ and $-e_j$ in turn at four points: the two ends of the interval and two points inside it. After the iteration all singular values lie in $[1-e_j,\,1+e_j]$, so this becomes the design interval of the next iteration. Its ratio $(1-e_j)/(1+e_j)$ is closer to $1$ than $\ell_j/u_j$ was. Repeating this $K$ times gives the response $P$. Figure 2 shows the construction.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f2-ctrl"></div>
+<div class="plot" id="f2-plot"></div>
+<div class="mini" id="f2-mini"></div>
+</div>
+<figcaption><b>Figure 2. Polar Express, one iteration at a time.</b> Left: the error $1-p_j(x)$ of the best odd quintic on the current interval $[\ell_j,u_j]$. The diamonds mark the four points where it reaches $\pm e_j$. Over the iterations the interval shrinks toward $1$. Right: the worst-case error after each iteration for five design intervals $[\rho,1]$. The dotted lines are three target accuracies. The line below the plot gives the interval, the coefficients and the error of the current iteration.</figcaption>
+</figure>
+
+<p><strong>A broader interval needs more iterations.</strong> Only the ratio $\rho=\ell_0/u_0$ matters, and a smaller ratio, meaning a broader interval, always gives a larger error for the same number of iterations. When the ratio is very small, one quintic cannot do much. It has to raise the small singular values but stay bounded at the top of the interval, so the error stays close to $1$ for the first iterations. Once the ratio reaches about $10^{-1}$ the error drops fast, and two or three more iterations are enough.</p>
+
+<p><strong>Below $\rho$.</strong> The routine gives no guarantee there. For $x$ much smaller than $\ell_j$ an iteration is close to linear, $p_j(x)\approx a_jx$, so singular values far below $\rho$ stay small. This does not matter if no singular values are that small. But if the spectrum ends two decades above $\rho$, the iterations spent growing the interval from $\rho$ up to the true $\sigma_{\min}/\sigma_{\max}$ did no useful work.</p>
+
+<p><strong>Choosing $\rho$.</strong> Muon does not know the spectrum of $M$, so it uses one interval for every matrix. Polar Express<sup class="fn"><a href="#ref-pe">[3]</a></sup> recommends $\rho=10^{-3}$. This choice assumes that singular values below $10^{-3}$ do not matter, since the routine leaves them small. That is not always the case: the attention matrices in Section 6 have a tail that reaches $10^{-5}$. In this post the fixed routine uses the more conservative interval $[10^{-5},1]$. It covers such tails, but it spends more iterations on matrices that do not have one. Figure 3 compares the response of a routine with real spectra.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f3-ctrl"></div>
+<div class="plot" id="f3-plot"></div>
+</div>
+<figcaption><b>Figure 3. What a routine does to each singular value, and where the singular values are.</b> The violet curve is the response $P(x)$ of the Polar Express routine for $[\rho,1]$ with $K$ iterations. The blue area is the spectrum of a real momentum matrix, as a density in $\log_{10}\sigma$. The routine brings the singular values inside its design interval to $1$ and leaves the ones to the left (shaded) small. With $\rho=10^{-3}$ and $K=5$, an MLP spectrum lies inside the design interval and is brought close to $1$, while the tail of a Q spectrum is left small.</figcaption>
+</figure>
+
+<p>In the matrices we study, MLP spectra end two decades above the conservative lower endpoint, while attention spectra have a tail that reaches it. For MLP matrices, many of the iterations are spent on a part of the interval that holds no singular values.</p>
+
+<div class="callout q">
+<div class="lbl">The question</div>
+<p>Can we find where the singular values of $M$ are, cheaply and without an SVD, and then choose a routine that fits each matrix?</p>
+</div>
+
+<!-- ================================================================ 3 -->
+<h2 id="sec-sensor"><span class="num">3</span>Newton–Schulz measures its own input</h2>
+
+<p>Each iteration forms $A_j=X_jX_j^\top$ and $B_j=A_j^2$. These two matrices are already in memory, and four numbers follow from them by scalar reductions (sums of squares and inner products), without any extra matrix multiplication:</p>
+$$\mathrm{tr}\,A_j,\qquad \|A_j\|_F^2=\mathrm{tr}\,A_j^2,\qquad \langle A_j,B_j\rangle_F=\mathrm{tr}\,A_j^3,\qquad \|B_j\|_F^2=\mathrm{tr}\,A_j^4 .$$
+
+<p>Let $z_j(x)$ be the value that a singular value $x$ of $X_0$ has after $j$ iterations, so $z_0(x)=x$ and $z_{j+1}=p_j(z_j)$. If $X_0=U\,\mathrm{diag}(\gamma_i)\,V^\top$, then $X_j=UZ_jV^\top$ with $Z_j=\mathrm{diag}(z_j(\gamma_i))$. The eigenvalues of $A_j$ are $z_j(\gamma_i)^2$, so</p>
+$$m_{2k,j}\;:=\;\frac{\mathrm{tr}\,A_j^k}{r}\;=\;\frac1r\sum_{i=1}^{r}z_j(\gamma_i)^{2k}\;=\;\int z_j(x)^{2k}\,d\mu(x),\qquad k=1,2,3,4.$$
+<p>Here $r$ is the smaller dimension of $M$, and $\mu$ is the empirical spectrum of $X_0$, which puts mass $1/r$ on each $\gamma_i$. Each <em>spectral moment</em> $m_{2k,j}$ is the average of a known <em>measurement function</em> $\phi(x)=z_j(x)^{2k}$ over the singular values. The output gives one more moment, $\|X_K\|_F^2/r$. These identities are exact in exact arithmetic.</p>
+<p>Each iteration applies a different polynomial, so the moments from different iterations look at the same spectrum through different functions, and each one is sensitive to a different part of $[0,1]$. We call a Newton–Schulz run that records these moments a <em>measurement pass</em>. Figure 4 shows one.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f4-ctrl"></div>
+<div class="split">
+<div class="algo live" id="f4-algo"></div>
+<div class="plot" id="f4-plot"></div>
+</div>
+</div>
+<figcaption><b>Figure 4. A measurement pass, one iteration at a time.</b> Left: Newton–Schulz with the added scalar reductions. The highlighted lines belong to the current iteration, and the numbers are the moments of this matrix. Right, top: the singular values of the current iterate as they move toward $1$. Right, bottom: the moments read so far, four per iteration and one at the end.</figcaption>
+</figure>
+
+<p>Before the first iteration, $M$ has to be scaled so that all its singular values are at most $1$. Dividing by the Frobenius norm works, but it overestimates the largest singular value and wastes part of the interval. We use the Gram-power bound $s$ from CANS<sup class="fn"><a href="#ref-cans">[4]</a></sup> instead and start from $X_0=M/(s\|M\|_F)$. The bound is computed from the products of the first iteration and is close to the largest singular value of $M/\|M\|_F$. The measurement pass, the fit and the scoring all use this scale.</p>
+
+<!-- ================================================================ 4 -->
+<h2 id="sec-estimator"><span class="num">4</span>Fitting a spectrum to the moments</h2>
+
+<h3 id="sec-fit">4.1 A maximum-entropy moment fit</h3>
+
+<p>We describe the spectrum by masses $w_b\ge0$ on fixed grid points $g_1,\dots,g_B\in[0,1]$, spaced logarithmically. The mass $w_b$ is the fraction of singular values at $g_b$. A moment is the average of a known function over the singular values. On the grid, this average becomes a sum over the grid points weighted by $w_b$. With $\Phi_{qb}=\phi_q(g_b)$, the moments are linear in $w$:</p>
+$$\underbrace{\begin{pmatrix} m_{2,0}\\ m_{4,0}\\ m_{6,0}\\ m_{8,0}\\ m_{2,1}\\ \vdots\\ \|X_{K}\|_F^2/r \end{pmatrix}}_{y}
+\;\approx\;
+\underbrace{\begin{pmatrix} z_0(g_1)^{2} & \cdots & z_0(g_B)^{2}\\ z_0(g_1)^{4} & \cdots & z_0(g_B)^{4}\\ z_0(g_1)^{6} & \cdots & z_0(g_B)^{6}\\ z_0(g_1)^{8} & \cdots & z_0(g_B)^{8}\\ z_1(g_1)^{2} & \cdots & z_1(g_B)^{2}\\ \vdots & & \vdots\\ z_{K}(g_1)^{2} & \cdots & z_{K}(g_B)^{2} \end{pmatrix}}_{\Phi}
+\underbrace{\begin{pmatrix} w_1\\ w_2\\ \vdots\\ w_B \end{pmatrix}}_{w}$$
+<p>$\Phi$ depends only on the routine and the grid. We compute it once by running the scalar recursion $z_{j+1}=p_j(z_j)$ on the grid points. The masses must sum to $1$, and the second moment is known exactly from the scaling. Both enter as constraints:</p>
+$$\Delta=\Big\{w\ge0:\ \mathbf 1^\top w=1,\ \textstyle\sum_bw_bg_b^2=\tfrac{1}{rs^2}\Big\}.$$
+
+<p><strong>Step 1: best fit.</strong> Find the smallest weighted residual between the predicted and the measured moments,</p>
+$$\xi^\star=\min_{w\in\Delta}\|D(\Phi w-\hat y)\|_2 .$$
+<p>Here $D=\mathrm{diag}(1/d_q)$, and the row scales $d_q$ bring moments of very different sizes to a common scale.</p>
+
+<p><strong>Step 2: maximum entropy.</strong> Many grid measures reach this residual, because a finite set of moments cannot fix every grid weight. Among all measures whose residual is within $\kappa$ of the best, we take the one with maximum entropy:</p>
+$$\hat w=\arg\max\Big\{-\sum_bw_b\log w_b\ :\ w\in\Delta,\ \|D(\Phi w-\hat y)\|_2\le \xi^\star+\kappa\Big\}.$$
+<p>On a logarithmic grid, maximum entropy gives the flattest spectrum in $\log\sigma$ that agrees with the moments. Both problems are convex, and the entropy makes the answer unique.</p>
+
+<p>Figure 5 shows the effect of the entropy tolerance $\kappa$. Without it, the fit is one of many spiky measures that match the moments equally well. A small $\kappa$ gives a smooth fit with almost the same residual. A large $\kappa$ pushes the fit toward a flat spectrum, and the residual grows.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f5-ctrl"></div>
+<div class="plot" id="f5-plot"></div>
+<div class="mini" id="f5-mini"></div>
+</div>
+<figcaption><b>Figure 5. Choosing among equally good fits.</b> Left: the fitted spectrum of one matrix for different entropy tolerances $\kappa$, from the best fit alone (step 1 only) to a large $\kappa$. Right: the residual and the entropy of each fit. At a small $\kappa$ the entropy is already close to its maximum while the residual is still small. The line below the plot compares the band masses of the fit with the SVD.</figcaption>
+</figure>
+
+<h3 id="sec-ranges">4.2 What the fitted spectrum can predict</h3>
+
+<p>We do not need the exact spectrum. We only need the quantities used to score routines. A finite set of moments may not determine the spectrum, but it can determine an average $\int f\,d\mu$ when $f$ is close to a combination of the measurement functions. The error of the prediction then has three parts: how well the measurement functions approximate $f$, the error in the measured moments, and the residual of the fit (Theorem 2 in the paper<sup class="fn"><a href="#ref-paper">[1]</a></sup>).</p>
+<p>We can also see how much the moments leave open. For a linear quantity $c^\top w$, such as a band mass, the mass above the cutoff, or the CDF at a point, two linear programs give the smallest and the largest value that agrees with the moments:</p>
+$$\min\ /\ \max\ \big\{c^\top w:\ w\in\Delta,\ |(\Phi w-\hat y)_q|\le\text{tolerance}_q\ \text{ for all }q\big\}.$$
+<p>We call this interval the <em>guaranteed range</em>. The maximum-entropy fit $\hat w$ is one point inside it.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f6-ctrl"></div>
+<div class="plot" id="f6-plot"></div>
+<div class="mini" id="f6-mini"></div>
+</div>
+<figcaption><b>Figure 6. The fitted spectrum.</b> Left: density of the singular values in $\log_{10}\sigma$ for one matrix (layer 5, step 16k), in bins of one eighth of a decade. Black is the SVD, which we use only for evaluation. Blue is the maximum-entropy moment fit, binned the same way. Right: the CDF of the singular values above the scoring cutoff, with the guaranteed range (gray). The fit recovers both the broad attention spectra and the narrow MLP spectra. The slider sets how many iterations of the measurement pass the fit uses: fewer iterations give fewer moments and a coarser fit. The line below the plot lists the decade band masses.</figcaption>
+</figure>
+
+<!-- ================================================================ 5 -->
+<h2 id="sec-dict"><span class="num">5</span>Selecting a Polar Express routine</h2>
+
+<h3 id="sec-dict-a">5.1 The candidate set</h3>
+
+<p>A candidate $\pi=(\rho_\pi,K_\pi)$ in the candidate set $\mathcal C$ is a full Polar Express routine: the composition designed for $[\rho_\pi,1]$, with $K_\pi$ iterations and response $P_\pi$. The candidates cover design lower endpoints from $10^{-5}$ to $10^{-1}$ and several depths. We compute the response of every candidate at the grid points once, before training. Each setting of the two sliders in Figure 3 is one candidate. Fixed PE, $[10^{-5},1]$, is the most conservative one.</p>
+
+<h3 id="sec-dict-b">5.2 Scoring each candidate</h3>
+
+<p>We score all candidates on the same interval $R=[x^\star/s,\,1]$. The <em>scoring cutoff</em> $x^\star=10^{-5}$ is fixed relative to the Frobenius norm, and singular values below it are ignored. We measure a routine by its RMS error, the root-mean-square distance of the output singular values from $1$ over the scored singular values. The true error and the error predicted from the fit are</p>
+$$E_R^2(P_\pi)=\frac{\int_R\big(1-P_\pi(x)\big)^2\,d\mu(x)}{\mu(R)},\qquad \widehat E_\pi^2=\frac{\sum_{g_b\in R}\hat w_b\,\big(1-P_\pi(g_b)\big)^2}{\sum_{g_b\in R}\hat w_b}.$$
+<p>The predicted error is a spectral average of the kind described in Section 4.2. The responses are precomputed, so scoring takes only scalar operations on the fitted spectrum and no matrix products.</p>
+
+<h3 id="sec-dict-c">5.3 Fixed-depth and target rules</h3>
+
+<p>The same scores serve two goals:</p>
+$$\begin{aligned}
+\text{fixed-depth rule:}&\qquad \hat\pi_K\in\arg\min_{\pi\in\mathcal C,\ K_\pi=K}\ \widehat E_\pi,\\[4pt]
+\text{target rule:}&\qquad \hat\pi_\tau\in\arg\min_{\pi\in\mathcal C,\ \widehat E_\pi\le\tau}\ K_\pi .
+\end{aligned}$$
+<p>The fixed-depth rule picks the routine with the lowest predicted error for a given number of iterations. The target rule picks the shortest routine whose predicted error is at most $\tau$. If no candidate reaches $\tau$, it falls back to fixed PE at the largest allowed depth. Figure 7 shows both choices for one matrix.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f7-ctrl"></div>
+<div class="plot" id="f7-plot"></div>
+</div>
+<figcaption><b>Figure 7. Both rules from one set of scores.</b> Left: the predicted RMS error of every candidate for one matrix, with the design lower endpoint $\rho$ across and the number of iterations $K$ down. Violet dots are the fixed-depth choices at each $K$. Green stars are the choices of the RMS oracle, which knows the true spectrum. The two mostly coincide. The open square is the target rule's choice, the smallest $K$ whose best predicted error is at most $\tau$. Right: the row picked with the slider, predicted (blue, dashed) and true (black). The prediction is most accurate near the minimum, which is the part the rules use.</figcaption>
+</figure>
+
+<p>Several matrices can also share one routine. The moments are averages over the spectrum, so the average of the moments of a group of matrices, for example all matrices of one type, gives the moments of their combined spectrum. One fit then serves the whole group.</p>
+
+<!-- ================================================================ 6 -->
+<h2 id="sec-drift"><span class="num">6</span>Spectra across layers and training</h2>
+
+<p>The best routine depends on the spectrum, and momentum spectra change across matrix types, across layers, and during training. Figures 8 and 9 show this for the run we study. Attention spectra are broad: most of the mass is above $10^{-3}$, with a tail down to $10^{-5}$. MLP spectra are narrow and lie above $10^{-3}$. One conservative interval has to cover all of these cases, including matrices with almost no mass near its lower end.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f9-ctrl"></div>
+<div class="plot" id="f9-plot"></div>
+</div>
+<figcaption><b>Figure 8. Spectra during training.</b> Density (top) and CDF (bottom) of the singular values above the scoring cutoff for four matrices of layer 5, at the checkpoint chosen with the slider. The dotted gray curves show the first checkpoint. The attention spectra keep their two-part shape and move slowly. The MLP spectrum stays narrow.</figcaption>
+</figure>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f10-ctrl"></div>
+<div class="plot" id="f10-plot"></div>
+</div>
+<figcaption><b>Figure 9. Decade band masses during training.</b> Median over the layers (line) and 10–90% range across layers (shaded) for each matrix type.</figcaption>
+</figure>
+
+<p>After the first part of training the spectra change slowly, so a routine chosen from one measurement stays a good choice for many steps. Matrices of the same type differ more from layer to layer than a single matrix changes over time, which is why we choose a routine for each matrix.</p>
+
+<!-- ================================================================ 7 -->
+<h2 id="sec-adaptive"><span class="num">7</span>Periodic measurement</h2>
+
+<div class="diagram">
+<svg viewBox="0 0 760 210" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="ao2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#6d4bd6"/></marker>
+  <marker id="ab2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#2a6ebb"/></marker></defs>
+  <g font-family="IBM Plex Sans, sans-serif" font-size="12.5" fill="#1b1f24">
+    <text x="12" y="62" font-weight="600" fill="#5f6b76">GPU</text>
+    <g id="steps">
+      <rect x="60" y="44" width="34" height="28" rx="5" fill="#f5f6f7" stroke="#1b1f24" stroke-width="1"/>
+      <rect x="104" y="44" width="34" height="28" rx="5" fill="#f5f6f7" stroke="#1b1f24" stroke-width="1"/>
+      <rect x="148" y="44" width="34" height="28" rx="5" fill="#f5f6f7" stroke="#1b1f24" stroke-width="1"/>
+      <rect x="192" y="44" width="34" height="28" rx="5" fill="#e8e1fa" stroke="#6d4bd6" stroke-width="1.4"/>
+      <rect x="236" y="44" width="34" height="28" rx="5" fill="#f5f6f7" stroke="#1b1f24" stroke-width="1"/>
+      <rect x="280" y="44" width="34" height="28" rx="5" fill="#f5f6f7" stroke="#1b1f24" stroke-width="1"/>
+      <rect x="324" y="44" width="34" height="28" rx="5" fill="#f5f6f7" stroke="#1b1f24" stroke-width="1"/>
+      <rect x="368" y="44" width="34" height="28" rx="5" fill="#f5f6f7" stroke="#1b1f24" stroke-width="1"/>
+      <rect x="412" y="44" width="34" height="28" rx="5" fill="#f5f6f7" stroke="#1b1f24" stroke-width="1"/>
+      <text x="470" y="63" fill="#5f6b76">· · ·</text>
+      <rect x="500" y="44" width="34" height="28" rx="5" fill="#f5f6f7" stroke="#1b1f24" stroke-width="1"/>
+      <rect x="544" y="44" width="34" height="28" rx="5" fill="#f5f6f7" stroke="#1b1f24" stroke-width="1"/>
+      <rect x="588" y="44" width="34" height="28" rx="5" fill="#dbe7f7" stroke="#2a6ebb" stroke-width="1.4"/>
+      <rect x="632" y="44" width="34" height="28" rx="5" fill="#f5f6f7" stroke="#1b1f24" stroke-width="1"/>
+      <rect x="676" y="44" width="34" height="28" rx="5" fill="#f5f6f7" stroke="#1b1f24" stroke-width="1"/>
+    </g>
+    <text x="209" y="18" text-anchor="middle" fill="#6d4bd6" font-weight="600">measurement pass</text>
+    <text x="209" y="34" text-anchor="middle" fill="#8a949e" font-size="11">its output is the update</text>
+    <text x="605" y="26" text-anchor="middle" fill="#2a6ebb" font-weight="600">new routines take effect</text>
+    <text x="77" y="88" text-anchor="middle" fill="#8a949e" font-size="11">step t</text>
+    <text x="693" y="88" text-anchor="middle" fill="#8a949e" font-size="11">t + T</text>
+    <text x="12" y="152" font-weight="600" fill="#5f6b76">CPU</text>
+    <path d="M209 72 V 110 H 232" fill="none" stroke="#6d4bd6" stroke-width="1.6" marker-end="url(#ao2)"/>
+    <text x="218" y="100" fill="#6d4bd6" font-size="11">spectral moments</text>
+    <rect x="236" y="118" width="330" height="60" rx="7" fill="#f3effc" stroke="#6d4bd6" stroke-width="1.2"/>
+    <text x="401" y="142" text-anchor="middle">fit ŵ for every matrix · score every candidate</text>
+    <text x="401" y="163" text-anchor="middle">select a routine for every matrix</text>
+    <path d="M566 148 H 605 V 74" fill="none" stroke="#2a6ebb" stroke-width="1.6" marker-end="url(#ab2)"/>
+    <text x="380" y="200" text-anchor="middle" fill="#8a949e" font-size="11.5">the GPU keeps using the old routines until the fit is done</text>
+  </g>
+</svg>
+</div>
+
+<p><strong>Measure every $T$ steps.</strong> Every $T$ training steps, each momentum matrix goes through a measurement pass. This is Newton–Schulz with a measurement routine $S_{\rm meas}$ of depth $K_{\rm meas}$. Its output is the update for that step, and its moments are recorded. If the steps in between use $\bar K$ iterations on average, the average number of iterations per step is</p>
+$$K_{\rm eff}=\bar K+\frac{K_{\rm meas}-\bar K}{T}.$$
+<p>The extra cost of measuring shrinks as $T$ grows.</p>
+
+<p><strong>Fit and select in the background.</strong> The fit and the scoring work on a fixed number of moments and a fixed grid, so their cost does not grow with the matrix size. They run on the CPU while the GPU keeps training with the current routines. When the CPU job is done, the new routines are used from the next step on.</p>
+
+<div class="algo">
+<div class="t">Algorithm 1 · Periodic spectral estimation</div>
+<div class="ln"><span class="n"></span><span><span class="k">require</span> period $T$; measurement routine $S_{\rm meas}$ of depth $K_{\rm meas}$; candidate set; selection rule</span></div>
+<div class="ln"><span class="n">1</span><span>use $S_{\rm meas}$ for every matrix</span></div>
+<div class="ln"><span class="n">2</span><span><span class="k">for</span> optimizer steps $t = 0, 1, \dots$</span></div>
+<div class="ln"><span class="n">3</span><span class="i1">form the current momenta and their normalization</span></div>
+<div class="ln"><span class="n">4</span><span class="i1"><span class="k">if</span> a finished fit is available: switch to the newly selected routines</span></div>
+<div class="ln"><span class="n">5</span><span class="i1"><span class="k">if</span> a measurement is due and no fit is running:</span></div>
+<div class="ln"><span class="n">6</span><span class="i2">run $S_{\rm meas}$, record the moments, and use its output for the update</span></div>
+<div class="ln"><span class="n">7</span><span class="i2">start fitting and selection in the background</span></div>
+<div class="ln"><span class="n">8</span><span class="i1"><span class="k">else</span>: apply the current routines</span></div>
+</div>
+
+<!-- ================================================================ 8 -->
+<h2 id="sec-results"><span class="num">8</span>Results</h2>
+
+<p>We test the method on Muon momentum matrices saved at several checkpoints of a GPT training run on FineWeb<sup class="fn"><a href="#ref-fw">[5]</a></sup>. They cover all seven matrix types: Q, K, V, O, MLP up, MLP gate and MLP down. We computed the SVD of every matrix offline and use it only to get the exact moments and as the ground truth. The fit only sees the moments, not the singular values. For each number of iterations $K$ we compare three methods:</p>
+<ul>
+<li><em>fixed PE</em> on $[10^{-5},1]$, the conservative routine of Section 2, which starts from $M/\|M\|_F$ as in Muon;</li>
+<li><em>ours</em>, the routine picked by spectral estimation;</li>
+<li>the <em>RMS oracle</em>, which picks from the same candidates using the true RMS error.</li>
+</ul>
+<p>The difference between ours and the RMS oracle shows how much we lose by not knowing the spectrum. Ours and the RMS oracle use the same scaling and candidates. All three are scored on the same singular values, and we report the RMS error of Section 5.2.</p>
+
+<h3 id="sec-r1">8.1 The fit recovers the spectrum at decade scale</h3>
+
+<div class="wide tables">
+<table class="tbl">
+<thead><tr><th>quantity</th><th>true (median)</th><th>|fit − true|, median (p90)</th><th>guaranteed range width, median</th><th>coverage</th></tr></thead>
+<tbody id="t1-body"></tbody>
+</table>
+<p class="tcap"><b>Table 1.</b> Band masses of the fitted spectrum compared with the SVD, over all saved matrices. All numbers are fractions of the singular values. Coverage counts the matrices whose true value falls inside the guaranteed range.</p>
+</div>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f12-ctrl"></div>
+<div class="plot" id="f12-plot"></div>
+</div>
+<figcaption><b>Figure 10. Fitted against true band mass.</b> Each point is one matrix and one decade band. The points lie on the diagonal.</figcaption>
+</figure>
+
+<p>The fit is accurate: the decade band masses are usually within a few thousandths of the true values. The guaranteed ranges always contain the true value, but they are wide: the error of the fit is 30 to 140 times smaller than the width of the range.</p>
+
+<h3 id="sec-r2">8.2 Fixed depth</h3>
+
+<figure class="wide">
+<div class="fig">
+<div class="controls" id="f13-ctrl"></div>
+<div class="plot" id="f13-plot"></div>
+</div>
+<figcaption><b>Figure 11. RMS error against the number of iterations.</b> Fixed PE, ours and the RMS oracle, on attention and MLP matrices. On attention matrices our curve is on top of the oracle's. On MLP matrices both are orders of magnitude below fixed PE.</figcaption>
+</figure>
+
+<div class="wide tables">
+<table class="tbl">
+<thead><tr><th>iterations K</th><th>fixed PE</th><th>ours</th><th>RMS oracle</th><th>fixed PE</th><th>ours</th><th>RMS oracle</th></tr>
+<tr><th></th><th colspan="3" style="text-align:center">attention (Q, K, V, O)</th><th colspan="3" style="text-align:center">MLP (up, gate, down)</th></tr></thead>
+<tbody id="t2-body"></tbody>
+</table>
+<p class="tcap"><b>Table 2.</b> RMS error for a fixed number of iterations $K$, median (mean) over the attention and the MLP matrices. Lower is better.</p>
+</div>
+
+<ul>
+<li><strong>MLP matrices.</strong> Their spectrum is narrow and lies above $10^{-3}$, so a routine designed for that interval brings every singular value close to $1$. With five iterations, our routine has a 90× lower mean RMS error than fixed PE.</li>
+<li><strong>Attention matrices.</strong> Their spectrum has a tail down to $10^{-5}$, and a routine with few iterations cannot bring that tail to $1$. Choosing the routine still lowers the error at every depth, but the tail limits how low the error can go.</li>
+<li><strong>Ours and the RMS oracle.</strong> On attention matrices the two have nearly the same median error at every depth, within $0.001$. On MLP matrices our mean error is within a few thousandths of the oracle's. The moments are enough to make almost the same choice as the true spectrum.</li>
+</ul>
+
+<h3 id="sec-r3">8.3 Target accuracy</h3>
+
+<p>Now the number of iterations is chosen as well. For a target $\tau$, the target rule picks for each matrix the shortest routine whose predicted RMS error is at most $\tau$. Fixed PE has to use one depth for all matrices, the smallest one that reaches $\tau$ on every spectrum.</p>
+
+<figure class="wide">
+<div class="fig">
+<div class="plot" id="f14-plot"></div>
+</div>
+<figcaption><b>Figure 12. Iterations needed to reach a target.</b> The single depth $K$ that fixed PE needs, and the mean depth that the target rule picks for ours and for the RMS oracle. MLP matrices reach the target with far fewer iterations. Attention matrices still need many iterations because of their tail.</figcaption>
+</figure>
+
+<div class="wide tables">
+<table class="tbl">
+<thead><tr><th>target τ</th><th>group</th><th>fixed PE</th><th>ours</th><th>RMS oracle</th><th>RMS error of ours, median</th></tr></thead>
+<tbody id="t3-body"></tbody>
+</table>
+<p class="tcap"><b>Table 3.</b> Target accuracy $\tau$. Depth of fixed PE, and mean depth picked by ours and by the RMS oracle.</p>
+</div>
+
+<p>At $\tau=10^{-1}$, ours and the RMS oracle pick almost the same depths. At the tighter targets, ours uses one or two more iterations than the oracle on MLP matrices. A predicted error of $10^{-2}$ or $10^{-3}$ is close to what a fit at decade resolution can tell apart, so the rule is more cautious there.</p>
+
+<!-- ================================================================ 9 -->
+<h2 id="sec-takeaways"><span class="num">9</span>Takeaways</h2>
+<ol>
+<li>Newton–Schulz already forms Gram matrices, and scalar reductions of them give spectral moments of its input. No extra matrix multiplications are needed.</li>
+<li>A maximum-entropy moment fit turns the moments into a spectrum that is accurate at the scale of a decade. This is enough to predict the RMS error of each candidate Polar Express routine.</li>
+<li>The fixed-depth rule picks the best routine for a given number of iterations. The target rule picks the shortest routine that is predicted to reach a given accuracy.</li>
+<li>Spectra differ across matrix types and layers and change slowly during training, so the measurement can be repeated periodically while the fit runs in the background.</li>
+<li>On saved momentum matrices, spectral estimation lowers the RMS error for a fixed number of iterations, most of all on MLP matrices, or reaches the same accuracy with fewer iterations. The paper<sup class="fn"><a href="#ref-paper">[1]</a></sup> also reports GPT pretraining runs, where adapting the routine to the spectrum lowers the validation loss of Muon and of Online KL-Shampoo.</li>
+</ol>
+
+<h2 id="refs">References</h2>
+<ol class="refs">
+<li id="ref-paper">K. Topollai, A. Choromanska. <em><a href="https://arxiv.org/abs/2609.33047">Cost-free spectral estimation for adaptive Newton–Schulz in matrix optimizers.</a></em> arXiv:2609.33047, 2026.</li>
+<li id="ref-muon">K. Jordan, Y. Jin, V. Boza, J. You, F. Cesista, L. Newhouse, J. Bernstein. <em>Muon: An optimizer for hidden layers in neural networks.</em> 2024. <a href="https://kellerjordan.github.io/posts/muon/">kellerjordan.github.io</a>.</li>
+<li id="ref-pe">N. Amsel, D. Persson, C. Musco, R. M. Gower. <em>The Polar Express: Optimal matrix sign methods and their application to the Muon algorithm.</em> ICLR 2026. <a href="https://arxiv.org/abs/2505.16932">arXiv:2505.16932</a>.</li>
+<li id="ref-cans">E. Grishina, M. Smirnov, M. Rakhuba. <em>Accelerating Newton–Schulz iteration for orthogonalization via Chebyshev-type polynomials.</em> 2025. <a href="https://arxiv.org/abs/2506.10935">arXiv:2506.10935</a>.</li>
+<li id="ref-fw">G. Penedo, H. Kydlíček, L. Ben allal, A. Lozhkov, M. Mitchell, C. Raffel, L. Von Werra, T. Wolf. <em>The FineWeb datasets: Decanting the web for the finest text data at scale.</em> NeurIPS Datasets and Benchmarks, 2024. <a href="https://arxiv.org/abs/2406.17557">arXiv:2406.17557</a>.</li>
+</ol>
+
+<h2 id="cite">Citation</h2>
+<p>To cite the results, please cite the paper<sup class="fn"><a href="#ref-paper">[1]</a></sup>:</p>
+<div class="bib" data-paper="muon"><button class="cp">copy</button><pre></pre></div>
+<p>To cite this post:</p>
+<div class="bib"><button class="cp">copy</button><pre>@misc{topollai2026adaptivens,
+  title        = {Adaptive {Newton--Schulz} via Spectral Estimation},
+  author       = {Topollai, Kristi},
+  year         = {2026},
+  month        = {September},
+  howpublished = {Blog post},
+  url          = {https://kristitopollai.github.io/blog/adaptive-muon/}
+}</pre></div>
+
+<footer>Kristi Topollai · September 2026 · <a href="../../">back to the site</a></footer>
+</article>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.35.3/plotly.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/contrib/auto-render.min.js"></script>
+<script src="data.js?v=20261003m"></script>
+<script src="app.js?v=20261003m"></script>
+<script src="../../data/papers.js?v=20261003m"></script>
+<script src="../cite.js?v=20261003m"></script>
+</body>
+</html>
